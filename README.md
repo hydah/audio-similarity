@@ -40,12 +40,24 @@ Compared against the original:
 
 - Python 3.9+
 - `ffmpeg` and `ffprobe` available in `PATH`
-- Python packages:
-  - `numpy`
-  - `scipy`
-  - `matplotlib`
 
-Install dependencies:
+## Setup (recommended: venv)
+
+Create and activate a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+On Windows (PowerShell), use:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+Install dependencies inside the virtual environment:
 
 ```bash
 pip install -r requirements.txt
