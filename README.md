@@ -48,7 +48,7 @@ Compared against the original:
 Install dependencies:
 
 ```bash
-pip install numpy scipy matplotlib
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -78,5 +78,6 @@ python3 audio_quality_compare.py original.aac aac_128k.aac aac_48k.aac -o audio_
 ```text
 audio-similarity/
   audio_quality_compare.py
+  requirements.txt
   README.md
 ```
