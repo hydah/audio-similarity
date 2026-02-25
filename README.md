@@ -1,63 +1,82 @@
 # audio-similarity
 
-`audio-similarity` is a starter repository for building audio similarity analysis workflows.
-It is designed to compare two or more audio clips and output a similarity score for ranking, filtering, or evaluation tasks.
+Audio quality comparison tool for AAC files at different bitrates.
 
-## Features
+This repository currently provides `audio_quality_compare.py`, which compares:
 
-- Compare audio pairs and generate similarity scores.
-- Support batch evaluation workflows (dataset-style processing).
-- Keep project structure simple and easy to extend.
-- Suitable for experimentation before productionization.
+- one original AAC file,
+- one high-bitrate AAC version,
+- one low-bitrate AAC version.
 
-## Getting Started
+It outputs:
 
-### 1) Clone the repository
+- a visual comparison report (`.png`), and
+- a console summary with objective quality metrics.
+
+## What the script does
+
+`audio_quality_compare.py` uses:
+
+- `ffprobe` to read bitrate/duration/size metadata,
+- `ffmpeg` to decode audio to mono float PCM (48kHz),
+- STFT and spectral features (including MFCC),
+- multiple objective metrics and a weighted composite score.
+
+It also aligns signals with cross-correlation to reduce encoder delay/padding effects.
+
+## Metrics included
+
+Compared against the original:
+
+- Spectral correlation (higher is better)
+- MFCC cosine similarity (higher is better)
+- Spectral centroid difference (lower is better)
+- RMS energy difference (lower is better)
+- Log-spectral distance (lower is better)
+- Effective bandwidth difference (closer to original is better)
+- Composite similarity score (0-100, higher is better)
+
+## Requirements
+
+- Python 3.9+
+- `ffmpeg` and `ffprobe` available in `PATH`
+- Python packages:
+  - `numpy`
+  - `scipy`
+  - `matplotlib`
+
+Install dependencies:
 
 ```bash
-git clone https://github.com/hydah/audio-similarity.git
-cd audio-similarity
+pip install numpy scipy matplotlib
 ```
 
-### 2) Prepare your environment
+## Usage
 
 ```bash
-# If/when dependencies are added
-npm install
+python3 audio_quality_compare.py <original.aac> <high_bitrate.aac> <low_bitrate.aac> -o report.png
 ```
 
-### 3) Add your implementation
+Example:
 
-This repository is intentionally minimal right now. Typical next steps:
+```bash
+python3 audio_quality_compare.py original.aac aac_128k.aac aac_48k.aac -o audio_quality_comparison.png
+```
 
-1. Add source code in `src/`.
-2. Add sample audio files in `data/` (or keep paths configurable).
-3. Add tests in `tests/`.
-4. Define runnable scripts in `package.json`.
+## Output
 
-## Suggested Project Structure
+- **PNG report** with:
+  - spectrograms for all three files,
+  - frequency-response overlay,
+  - per-metric normalized bars,
+  - effective bandwidth chart,
+  - composite score chart.
+- **Console report** with file info, per-metric values, and final conclusion.
+
+## Files
 
 ```text
 audio-similarity/
-  src/
-  tests/
-  data/
+  audio_quality_compare.py
   README.md
 ```
-
-## Development Notes
-
-- Keep changes incremental and testable.
-- Prefer clear, maintainable code over clever optimizations.
-- Add tests for each new behavior before large refactors.
-
-## Roadmap
-
-- [ ] Add baseline similarity pipeline (feature extraction + scoring).
-- [ ] Add CLI for single-file and batch comparison.
-- [ ] Add reproducible evaluation script and sample dataset format.
-- [ ] Add automated tests and CI checks.
-
-## License
-
-No license file has been added yet. Add a `LICENSE` file before public distribution.
