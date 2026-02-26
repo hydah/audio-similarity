@@ -17,3 +17,7 @@ env/
 
 # Audio files
 *.aac
+
+# Generated reports
+*.png
+res.txt

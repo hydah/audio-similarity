@@ -113,16 +113,88 @@ def align_signals(*signals: np.ndarray) -> list[np.ndarray]:
     return trim_to_shortest(*signals)
 
 
-def estimate_shift(reference: np.ndarray, test: np.ndarray, max_shift: int = 48000) -> int:
-    """Estimate sample shift to align test to reference via cross-correlation."""
-    # Use a chunk from the beginning for speed
-    chunk = min(max_shift * 4, len(reference), len(test))
-    ref_chunk = reference[:chunk]
-    test_chunk = test[:chunk]
+def estimate_shift(reference: np.ndarray, test: np.ndarray,
+                   max_shift: int = 48000 * 5) -> int:
+    """Estimate sample shift to align test to reference via normalized
+    envelope cross-correlation.
 
-    corr = np.correlate(ref_chunk, test_chunk[:max_shift * 2], mode="full")
-    best = np.argmax(corr)
-    return int(best - len(ref_chunk) + 1)
+    Handles multi-second offsets caused by leading silence, encoder pipeline
+    padding, or different trim points.  Uses 10ms RMS envelope frames with
+    Pearson correlation (immune to DC / silence bias), then refines to
+    sample-level accuracy.
+    """
+    env_hop = 480  # 10ms at 48kHz
+    min_overlap = 100  # minimum envelope frames for meaningful correlation
+
+    def _rms_env(y: np.ndarray) -> np.ndarray:
+        n = len(y) // env_hop
+        if n == 0:
+            return np.array([0.0])
+        return np.sqrt(np.mean(y[:n * env_hop].reshape(n, env_hop) ** 2, axis=1))
+
+    env_ref = _rms_env(reference)
+    env_test = _rms_env(test)
+    max_frames = max_shift // env_hop
+
+    best_corr = -2.0
+    best_frame_shift = 0
+
+    # Positive shift: reference leads (skip start of reference)
+    for f in range(max_frames):
+        n = min(len(env_ref) - f, len(env_test))
+        if n < min_overlap:
+            break
+        a = env_ref[f:f + n]
+        b = env_test[:n]
+        a_c = a - np.mean(a)
+        b_c = b - np.mean(b)
+        d = norm(a_c) * norm(b_c)
+        if d < 1e-20:
+            continue
+        c = float(np.dot(a_c, b_c) / d)
+        if c > best_corr:
+            best_corr = c
+            best_frame_shift = f
+
+    # Negative shift: test leads (skip start of test)
+    for f in range(1, max_frames):
+        n = min(len(env_ref), len(env_test) - f)
+        if n < min_overlap:
+            break
+        a = env_ref[:n]
+        b = env_test[f:f + n]
+        a_c = a - np.mean(a)
+        b_c = b - np.mean(b)
+        d = norm(a_c) * norm(b_c)
+        if d < 1e-20:
+            continue
+        c = float(np.dot(a_c, b_c) / d)
+        if c > best_corr:
+            best_corr = c
+            best_frame_shift = -f
+
+    # Convert to apply_shift convention: positive = test delayed (skip test start),
+    # negative = reference delayed (skip reference start).
+    coarse_shift = -best_frame_shift * env_hop
+
+    # Fine-tune: sample-level cross-correlation within ±env_hop of coarse
+    refine = env_hop * 2
+    seg_len = refine * 4
+    if coarse_shift >= 0:
+        ref_seg = reference[:seg_len]
+        test_seg = test[coarse_shift:coarse_shift + seg_len]
+    else:
+        cut = -coarse_shift
+        ref_seg = reference[cut:cut + seg_len]
+        test_seg = test[:seg_len]
+
+    if len(ref_seg) < refine or len(test_seg) < refine:
+        return coarse_shift
+
+    search = min(refine, len(ref_seg) // 2, len(test_seg) // 2)
+    fine_corr = np.correlate(ref_seg[:search * 2], test_seg[:search * 2], mode="full")
+    fine_offset = int(np.argmax(fine_corr)) - (search * 2) + 1
+    return coarse_shift + fine_offset
 
 
 def apply_shift(reference: np.ndarray, test: np.ndarray, shift: int) -> tuple[np.ndarray, np.ndarray]:
@@ -157,7 +229,7 @@ def build_common_aligned_triplet(reference: np.ndarray,
 
 
 def cross_correlate_align(reference: np.ndarray, test: np.ndarray,
-                          max_shift: int = 48000) -> tuple[np.ndarray, np.ndarray]:
+                          max_shift: int = 48000 * 5) -> tuple[np.ndarray, np.ndarray]:
     """Align test signal to reference using cross-correlation (up to max_shift samples).
 
     This compensates for encoder delay / padding differences between AAC files.
@@ -374,6 +446,92 @@ def side_high_freq_loss(reference_stereo: np.ndarray, test_stereo: np.ndarray, c
     return abs(ref_hf - test_hf)
 
 
+def temporal_envelope_correlation(reference: np.ndarray, test: np.ndarray,
+                                  frame_size: int = 2048, hop: int = 512) -> float:
+    """Pearson correlation of frame-level RMS envelopes ([-1, 1]).
+
+    Captures transient preservation: if attacks are smeared or dynamics
+    flattened by encoding, the envelope correlation drops.
+    """
+    def _rms_envelope(y: np.ndarray) -> np.ndarray:
+        n_frames = max(0, (len(y) - frame_size) // hop + 1)
+        if n_frames == 0:
+            return np.array([])
+        frames = np.lib.stride_tricks.as_strided(
+            y, shape=(n_frames, frame_size),
+            strides=(y.strides[0] * hop, y.strides[0]),
+        )
+        return np.sqrt(np.mean(frames ** 2, axis=1))
+
+    env_ref = _rms_envelope(reference)
+    env_test = _rms_envelope(test)
+    n = min(len(env_ref), len(env_test))
+    if n < 2:
+        return 1.0
+    env_ref, env_test = env_ref[:n], env_test[:n]
+    ref_c = env_ref - np.mean(env_ref)
+    test_c = env_test - np.mean(env_test)
+    denom = norm(ref_c) * norm(test_c)
+    if denom < 1e-20:
+        # Near-constant envelopes carry little comparative information.
+        # Return neutral-low confidence to avoid falsely inflating detail score.
+        return 0.0
+    return float(np.dot(ref_c, test_c) / denom)
+
+
+def hf_energy_retention(reference: np.ndarray, test: np.ndarray,
+                        cutoff_hz: float = 10000.0) -> float:
+    """Percentage of high-frequency energy retained above *cutoff_hz* (0-100+).
+
+    100 = identical HF energy, <100 = HF loss (the typical "detail gone" feel),
+    >100 = HF boost (rare but defensive).
+    """
+    freqs, _, Zxx_ref = scipy_stft(reference, fs=SR, nperseg=N_FFT, noverlap=N_FFT - HOP)
+    _, _, Zxx_test = scipy_stft(test, fs=SR, nperseg=N_FFT, noverlap=N_FFT - HOP)
+    n_bins = min(Zxx_ref.shape[0], Zxx_test.shape[0], len(freqs))
+    n_frames = min(Zxx_ref.shape[1], Zxx_test.shape[1])
+    freqs = freqs[:n_bins]
+    S_ref = np.abs(Zxx_ref[:n_bins, :n_frames]) ** 2
+    S_test = np.abs(Zxx_test[:n_bins, :n_frames]) ** 2
+
+    mask = freqs >= cutoff_hz
+    if not np.any(mask):
+        return 100.0
+
+    ref_total = float(np.sum(S_ref[mask, :]))
+    if ref_total < 1e-30:
+        return 100.0
+    test_total = float(np.sum(S_test[mask, :]))
+    return float(test_total / ref_total * 100)
+
+
+def spectral_flux_similarity(reference: np.ndarray, test: np.ndarray) -> float:
+    """Pearson correlation of spectral-flux sequences ([-1, 1]).
+
+    Spectral flux measures how rapidly the spectrum changes frame to frame.
+    A high correlation means the test preserves the temporal "liveliness" of
+    the original — attacks, decays, and micro-dynamics.
+    """
+    def _flux(y: np.ndarray) -> np.ndarray:
+        _, _, Zxx = scipy_stft(y, fs=SR, nperseg=N_FFT, noverlap=N_FFT - HOP)
+        mag = np.abs(Zxx)
+        return np.sqrt(np.sum(np.diff(mag, axis=1) ** 2, axis=0))
+
+    flux_ref = _flux(reference)
+    flux_test = _flux(test)
+    n = min(len(flux_ref), len(flux_test))
+    if n < 2:
+        return 1.0
+    flux_ref, flux_test = flux_ref[:n], flux_test[:n]
+    ref_c = flux_ref - np.mean(flux_ref)
+    test_c = flux_test - np.mean(flux_test)
+    denom = norm(ref_c) * norm(test_c)
+    if denom < 1e-20:
+        # Near-constant flux sequence is effectively non-informative.
+        return 0.0
+    return float(np.dot(ref_c, test_c) / denom)
+
+
 def effective_bandwidth(y: np.ndarray, rolloff_db: float = -20.0) -> float:
     """Find effective bandwidth: highest frequency where average spectrum is within
     rolloff_db of the peak in the 1-10kHz range.
@@ -437,10 +595,28 @@ def side_spatial_score(side_corr: float, side_ratio_diff: float, side_hf_loss: f
     return sum(w * s for w, s in zip(weights, scores)) * 100
 
 
-def overall_score(core_score: float, spatial_score: float, spatial_weight: float = 0.2) -> float:
-    """Blend core quality score with spatial score."""
+def detail_score(env_corr: float, hf_retention: float, flux_corr: float) -> float:
+    """Detail preservation score (0-100). Higher = better fine-detail retention."""
+    env_s = max(env_corr, 0.0)
+    hf_s = max(min(hf_retention, 100.0) / 100.0, 0.0)
+    flux_s = max(flux_corr, 0.0)
+    weights = [0.35, 0.35, 0.30]
+    scores = [env_s, hf_s, flux_s]
+    return sum(w * s for w, s in zip(weights, scores)) * 100
+
+
+def overall_score(core_score: float, detail_sc: float, spatial_score: float,
+                  detail_weight: float = 0.2, spatial_weight: float = 0.2) -> float:
+    """Blend core, detail, and spatial scores."""
+    detail_weight = min(max(detail_weight, 0.0), 1.0)
     spatial_weight = min(max(spatial_weight, 0.0), 1.0)
-    return (1.0 - spatial_weight) * core_score + spatial_weight * spatial_score
+    total_extra = detail_weight + spatial_weight
+    if total_extra > 1.0:
+        scale = 1.0 / total_extra
+        detail_weight *= scale
+        spatial_weight *= scale
+    core_weight = 1.0 - detail_weight - spatial_weight
+    return core_weight * core_score + detail_weight * detail_sc + spatial_weight * spatial_score
 
 
 def adaptive_spatial_weight(reference_stereo: np.ndarray,
@@ -541,8 +717,9 @@ def create_comparison_chart(
     # 3a: Normalized per-metric scores (0-1 scale, higher = better)
     ax_snr = fig.add_subplot(gs[2, 0])
     metric_names = [
-        "Spectral\nCorr", "MFCC\nSim", "Centroid\nΔ", "LSD", "Bandwidth",
-        "Side\nCorr", "Side Ratio\nDrift", "Side HF\nLoss",
+        "Spectral\nCorr", "MFCC\nSim", "Centroid\nΔ", "LSD", "BW",
+        "Envelope\nCorr", "HF\nRetain", "Spectral\nFlux",
+        "Side\nCorr", "Side\nDrift", "Side\nHF",
     ]
 
     def _normalize_metrics(m: dict, bw_orig: float) -> list:
@@ -553,6 +730,9 @@ def create_comparison_chart(
             max(1.0 - m["centroid_diff"] / 2000.0, 0.0),
             max(1.0 - m["lsd"] / 20.0, 0.0),
             max(1.0 - abs(m["effective_bw"] - bw_orig) / 10000.0, 0.0),
+            max(m["env_corr"], 0.0),
+            max(min(m["hf_retention"], 100.0) / 100.0, 0.0),
+            max(m["flux_corr"], 0.0),
             max(m["side_corr"], 0.0),
             max(1.0 - m["side_ratio_diff"] / 100.0, 0.0),
             max(1.0 - m["side_hf_loss"] / 20.0, 0.0),
@@ -568,11 +748,10 @@ def create_comparison_chart(
     ax_snr.bar(x_pos + width / 2, norm_low,
                width, color=C_LOW, label=f"{info_low['bitrate_kbps']}kbps")
     ax_snr.set_xticks(x_pos)
-    ax_snr.set_xticklabels(metric_names, fontsize=8)
+    ax_snr.set_xticklabels(metric_names, fontsize=7)
     ax_snr.set_ylabel("Normalized Score (0-1)")
     ax_snr.set_ylim(0, 1.1)
-    side_w = metrics_high.get("spatial_weight", 0.2) * 100
-    ax_snr.set_title(f"Per-Metric Scores (including Side, weight {side_w:.0f}%)",
+    ax_snr.set_title("Per-Metric Scores (Core / Detail / Side)",
                      fontsize=12, fontweight="bold")
     ax_snr.legend(fontsize=9)
     ax_snr.grid(True, axis="y", alpha=0.3)
@@ -610,7 +789,7 @@ def create_comparison_chart(
     ax_score.set_xticklabels([f"{info_high['bitrate_kbps']}kbps",
                                f"{info_low['bitrate_kbps']}kbps"])
     ax_score.set_ylabel("Score (0-100)")
-    ax_score.set_title("Overall Score (Core + Side)", fontsize=12, fontweight="bold")
+    ax_score.set_title("Overall Score (Core + Detail + Side)", fontsize=12, fontweight="bold")
     ax_score.set_ylim(0, 100)
     ax_score.grid(True, axis="y", alpha=0.3)
     for bar, val in zip(bars_s, [score_high, score_low]):
@@ -630,8 +809,9 @@ def _count_metric_votes(metrics_high: dict, metrics_low: dict) -> dict:
     """Count per-metric wins. Returns {"high": N, "low": N, "tie": N}.
 
     Metric interpretation:
-      - spec_corr, mfcc_sim: higher is better (closer to 1.0)
-      - centroid_diff, rms_diff, lsd: lower is better (closer to 0)
+      - spec_corr, mfcc_sim, env_corr, flux_corr: higher is better
+      - centroid_diff, rms_diff, lsd: lower is better
+      - hf_retention: closer to 100 is better
       - effective_bw: closer to bw_orig is better
       - side_corr: higher is better
       - side_ratio_diff, side_hf_loss: lower is better
@@ -645,13 +825,16 @@ def _count_metric_votes(metrics_high: dict, metrics_low: dict) -> dict:
         "centroid_diff": 1.0,
         "rms_diff": 0.1,
         "lsd": 0.1,
+        "env_corr": 1e-3,
+        "hf_retention": 1.0,
+        "flux_corr": 1e-3,
         "side_corr": 1e-3,
         "side_ratio_diff": 0.5,
         "side_hf_loss": 0.2,
     }
 
     # Higher-is-better metrics
-    for key in ("spec_corr", "mfcc_sim"):
+    for key in ("spec_corr", "mfcc_sim", "env_corr", "flux_corr"):
         h, l = metrics_high[key], metrics_low[key]
         eps = eps_map[key]
         if abs(h - l) < eps:
@@ -671,6 +854,16 @@ def _count_metric_votes(metrics_high: dict, metrics_low: dict) -> dict:
             high_wins += 1
         else:
             low_wins += 1
+
+    # HF retention: closer to 100% is better
+    hf_h = abs(metrics_high["hf_retention"] - 100.0)
+    hf_l = abs(metrics_low["hf_retention"] - 100.0)
+    if abs(hf_h - hf_l) < eps_map["hf_retention"]:
+        ties += 1
+    elif hf_h < hf_l:
+        high_wins += 1
+    else:
+        low_wins += 1
 
     # Side metrics are counted only when reference side field is meaningful.
     if metrics_high.get("spatial_weight", 0.2) >= 0.05:
@@ -743,14 +936,26 @@ def print_report(
     print(f"  {'  [lower=better]':<28}")
     print(f"  {'Effective Bandwidth (kHz)':<28} {metrics_high['effective_bw']/1000:>10.1f} {metrics_low['effective_bw']/1000:>10.1f}")
     print(f"  {'  (Original: {:.1f} kHz)'.format(metrics_high['bw_orig']/1000):<28}")
+    print(f"  {line}")
+    print(f"  {'Envelope Corr [0-1]':<28} {metrics_high['env_corr']:>10.4f} {metrics_low['env_corr']:>10.4f}")
+    print(f"  {'  [higher=better, transients]':<28}")
+    print(f"  {'HF Energy Retention (%)':<28} {metrics_high['hf_retention']:>10.1f} {metrics_low['hf_retention']:>10.1f}")
+    print(f"  {'  [closer to 100=better]':<28}")
+    print(f"  {'Spectral Flux Corr [0-1]':<28} {metrics_high['flux_corr']:>10.4f} {metrics_low['flux_corr']:>10.4f}")
+    print(f"  {'  [higher=better, dynamics]':<28}")
+    print(f"  {line}")
     print(f"  {'Side Spectral Corr [0-1]':<28} {metrics_high['side_corr']:>10.4f} {metrics_low['side_corr']:>10.4f}")
     print(f"  {'Side Ratio Drift (%)':<28} {metrics_high['side_ratio_diff']:>10.2f} {metrics_low['side_ratio_diff']:>10.2f}")
     print(f"  {'Side HF Loss >6k (dB)':<28} {metrics_high['side_hf_loss']:>10.2f} {metrics_low['side_hf_loss']:>10.2f}")
     print(f"  {line}")
     print(f"  {'CORE SCORE [0-100]':<28} {metrics_high['composite']:>10.1f} {metrics_low['composite']:>10.1f}")
+    print(f"  {'DETAIL SCORE [0-100]':<28} {metrics_high['detail']:>10.1f} {metrics_low['detail']:>10.1f}")
     print(f"  {'SPATIAL SIDE SCORE [0-100]':<28} {metrics_high['side_score']:>10.1f} {metrics_low['side_score']:>10.1f}")
     print(f"  {'OVERALL SCORE [0-100]':<28} {metrics_high['overall']:>10.1f} {metrics_low['overall']:>10.1f}")
-    print(f"  {'  (Side weight in overall)':<28} {metrics_high['spatial_weight']*100:>9.1f}%")
+    detail_w = 20.0
+    side_w = metrics_high["spatial_weight"] * 100.0
+    core_w = max(0.0, 100.0 - detail_w - side_w)
+    print(f"  {'  (Weights: core/detail/side)':<28} {f'{core_w:.0f}/{detail_w:.0f}/{side_w:.0f}%':>10}")
     if metrics_high["spatial_weight"] < 0.05:
         print(f"  {'  [note: source is near-mono; side metrics downweighted]':<28}")
 
@@ -804,6 +1009,11 @@ def main() -> None:
         "-o", "--output",
         default="audio_quality_comparison.png",
         help="Output PNG path (default: audio_quality_comparison.png)",
+    )
+    parser.add_argument(
+        "-t", "--text-output",
+        default=None,
+        help="Save console report to a text file",
     )
     args = parser.parse_args()
 
@@ -872,6 +1082,9 @@ def main() -> None:
         "rms_diff": rms_difference(y_orig_h, y_high),
         "lsd": log_spectral_distance(y_orig_h, y_high),
         "effective_bw": effective_bandwidth(y_high),
+        "env_corr": temporal_envelope_correlation(y_orig_h, y_high),
+        "hf_retention": hf_energy_retention(y_orig_h, y_high),
+        "flux_corr": spectral_flux_similarity(y_orig_h, y_high),
         "side_corr": side_spectral_correlation(y_orig_st_h, y_high_st),
         "side_ratio_diff": side_energy_ratio_diff(y_orig_st_h, y_high_st),
         "side_hf_loss": side_high_freq_loss(y_orig_st_h, y_high_st),
@@ -884,6 +1097,11 @@ def main() -> None:
         metrics_high["effective_bw"] - bw_orig,
         metrics_high["lsd"],
     )
+    metrics_high["detail"] = detail_score(
+        metrics_high["env_corr"],
+        metrics_high["hf_retention"],
+        metrics_high["flux_corr"],
+    )
     metrics_high["side_score"] = side_spatial_score(
         metrics_high["side_corr"],
         metrics_high["side_ratio_diff"],
@@ -891,7 +1109,9 @@ def main() -> None:
     )
     metrics_high["spatial_weight"] = spatial_weight
     metrics_high["overall"] = overall_score(
-        metrics_high["composite"], metrics_high["side_score"], spatial_weight=spatial_weight
+        metrics_high["composite"], metrics_high["detail"],
+        metrics_high["side_score"],
+        detail_weight=0.2, spatial_weight=spatial_weight,
     )
 
     metrics_low = {
@@ -901,6 +1121,9 @@ def main() -> None:
         "rms_diff": rms_difference(y_orig_l, y_low),
         "lsd": log_spectral_distance(y_orig_l, y_low),
         "effective_bw": effective_bandwidth(y_low),
+        "env_corr": temporal_envelope_correlation(y_orig_l, y_low),
+        "hf_retention": hf_energy_retention(y_orig_l, y_low),
+        "flux_corr": spectral_flux_similarity(y_orig_l, y_low),
         "side_corr": side_spectral_correlation(y_orig_st_l, y_low_st),
         "side_ratio_diff": side_energy_ratio_diff(y_orig_st_l, y_low_st),
         "side_hf_loss": side_high_freq_loss(y_orig_st_l, y_low_st),
@@ -913,6 +1136,11 @@ def main() -> None:
         metrics_low["effective_bw"] - bw_orig,
         metrics_low["lsd"],
     )
+    metrics_low["detail"] = detail_score(
+        metrics_low["env_corr"],
+        metrics_low["hf_retention"],
+        metrics_low["flux_corr"],
+    )
     metrics_low["side_score"] = side_spatial_score(
         metrics_low["side_corr"],
         metrics_low["side_ratio_diff"],
@@ -920,7 +1148,9 @@ def main() -> None:
     )
     metrics_low["spatial_weight"] = spatial_weight
     metrics_low["overall"] = overall_score(
-        metrics_low["composite"], metrics_low["side_score"], spatial_weight=spatial_weight
+        metrics_low["composite"], metrics_low["detail"],
+        metrics_low["side_score"],
+        detail_weight=0.2, spatial_weight=spatial_weight,
     )
 
     # Generate visualization
@@ -934,6 +1164,15 @@ def main() -> None:
 
     # Print report
     print_report(info_orig, info_high, info_low, metrics_high, metrics_low, args.output)
+
+    if args.text_output:
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_report(info_orig, info_high, info_low, metrics_high, metrics_low, args.output)
+        with open(args.text_output, "w", encoding="utf-8") as f:
+            f.write(buf.getvalue())
+        print(f"Text report saved to: {args.text_output}")
 
 
 if __name__ == "__main__":
